@@ -78,6 +78,14 @@ TEST_CASE_TIMEOUT_MS = 300000  # milliseconds
 # not be contacted.
 AUTO_PTS_LOCAL = "AUTO_PTS_LOCAL" in os.environ
 
+# IUT-side failures are handled by post_run cleanup; restarting PTS hangs when
+# the worker thread is still in RunTestCase().
+IUT_SIDE_ERRORS = {
+    ptstypes.E_BTP_ERROR,
+    ptstypes.E_BTP_FATAL_ERROR,
+    ptstypes.E_BTP_TIMEOUT,
+    ptstypes.E_IUT_INIT_ERROR,
+}
 
 def logger_log(self, *args, **kwargs):
     with log_lock:
@@ -1442,7 +1450,8 @@ def run_test_cases(ptses, test_case_instances, args, stats, **kwargs):
                 exeption_msg = ""
             log(f'exception_msg: {exeption_msg}')
 
-            if args.recovery and (exeption_msg != '' or status not in args.not_recover):
+            if (args.recovery and status not in IUT_SIDE_ERRORS and
+                    (exeption_msg != '' or status not in args.not_recover)):
                 run_recovery(args, ptses)
 
             if test_retry_count is not None:
@@ -1723,13 +1732,16 @@ def recover_at_exception(func):
     def _recover_at_exception(*args, **kwargs):
         restart_time = args[0].max_server_restart_time
 
-        while not get_global_end():
+        for _attempt in range(3):
+            if get_global_end():
+                break
+
             result = _attempt_func(*args, **kwargs)
             if not isinstance(result, Exception):
                 return result
 
-            logging.exception(result)
-            traceback.print_exc()
+            logging.error("Recovery failed: %r", result,
+                          exc_info=(type(result), result, result.__traceback__))
 
             if isinstance(result, RunEnd):
                 # Stopped with SIGINT
@@ -1742,6 +1754,7 @@ def recover_at_exception(func):
                 # superguard will work and trigger the restart.
                 restart_time = args[0].superguard
 
+        log('Recovery wrapper gave up, continuing')
         return None
 
     return _recover_at_exception
@@ -1758,46 +1771,45 @@ def run_recovery(args, ptses):
         iut.stop()
 
         if args.usb_replug_available:
-            iut.btattach_stop()
+            if hasattr(iut, 'btattach_stop'):
+                iut.btattach_stop()
             replug_usb(args, iut)
-            iut.btattach_start()
+            if hasattr(iut, 'btattach_start'):
+                iut.btattach_start()
 
     if hasattr(iut, 'select_iut'):
         iut.select_iut(0)
 
     for pts in ptses:
-        req_sent = False
-        last_restart_time = None
+        try:
+            pts.set_wid_response("Cancel")
+        except BaseException as e:
+            log(e)
 
-        while not get_global_end():
+        for attempt in range(1, 4):
+            if get_global_end():
+                break
             try:
-                if not last_restart_time:
-                    last_restart_time = pts.get_last_recovery_time()
-                    log(f'Last restart time of PTS {pts}: {last_restart_time}')
-
-                if not req_sent:
-                    log(f'Recovering PTS {pts} ...')
-                    pts.recover_pts()
-                    req_sent = True
-                    err = pts.callback.get_result('recover_pts', timeout=args.max_server_restart_time)
-                    if err:
-                        log('PTS recovered')
-                        break
-
-                if last_restart_time < pts.get_last_recovery_time():
+                log(f'Recovering PTS {pts} (attempt {attempt}/3) ...')
+                pts.callback._results['recover_pts'].clear()
+                pts.recover_pts()
+                err = pts.callback.get_result(
+                    'recover_pts', timeout=args.max_server_restart_time)
+                if err:
                     log('PTS recovered')
                     break
-
             except BaseException as e:
                 log(e)
 
-            log('Server is still resetting. Wait a little more.')
             time.sleep(1)
+        else:
+            log('PTS recovery failed after 3 attempts, continuing')
 
     for iut_id in args.iut_map.keys():
         if hasattr(iut, 'select_iut'):
             iut.select_iut(iut_id)
-        iut.cleanup_stack()
+        if hasattr(iut, 'cleanup_stack'):
+            iut.cleanup_stack()
 
     if hasattr(iut, 'select_iut'):
         iut.select_iut(0)
