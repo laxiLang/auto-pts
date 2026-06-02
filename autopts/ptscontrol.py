@@ -43,6 +43,8 @@ import xmlrpc.client
 from datetime import datetime
 from pathlib import Path
 
+import struct
+import subprocess
 import psutil
 import pythoncom
 import win32com.client
@@ -344,6 +346,228 @@ def parse_ptscontrol_error(err):
         # No HRESULT in excepinfo means that the call to COM Object
         # method failed, perhaps the PTS COM Object has been closed.
         return None
+
+_BPV_SIG_ROOT = r'C:\Program Files (x86)\Bluetooth SIG'
+_BPV_SIG_ROOT_64 = r'C:\Program Files\Bluetooth SIG'
+_BPV_ETS_MANAGER_REL = os.path.join('Bluetooth PTS', 'bin', 'ETSManager.dll')
+
+# Run in a 32-bit Python child when autoptsserver uses 64-bit Python.
+_BPV_SAVE_SUBPROCESS_PY = r'''
+import ctypes, os, sys, time
+dll_path, cfa_path = sys.argv[1], sys.argv[2]
+os.makedirs(os.path.dirname(cfa_path), exist_ok=True)
+lib = ctypes.CDLL(dll_path)
+lib.SnifferCanSaveEx.restype = ctypes.c_bool
+lib.SnifferCanSaveAndClearEx.restype = ctypes.c_bool
+can_save = bool(lib.SnifferCanSaveEx())
+can_save_clear = bool(lib.SnifferCanSaveAndClearEx())
+if not can_save and not can_save_clear:
+    sys.exit(2)
+path_bytes = cfa_path.encode("mbcs")
+lib.SnifferSaveEx.argtypes = [ctypes.c_char_p]
+lib.SnifferSaveAndClearEx.argtypes = [ctypes.c_char_p]
+if can_save:
+    lib.SnifferSaveEx(path_bytes)
+else:
+    lib.SnifferSaveAndClearEx(path_bytes)
+deadline = time.time() + 60
+while time.time() < deadline:
+    if os.path.isfile(cfa_path) and os.path.getsize(cfa_path) > 0:
+        sys.exit(0)
+    time.sleep(0.5)
+sys.exit(1)
+'''
+
+
+def _python_bitness():
+    return struct.calcsize('P') * 8
+
+
+def _iter_ets_manager_paths():
+    env_dll = os.environ.get('AUTO_PTS_ETS_MANAGER_DLL')
+    if env_dll:
+        yield env_dll
+
+    sig_roots = []
+    if os.environ.get('PTS_SIG_ROOT'):
+        sig_roots.append(os.environ['PTS_SIG_ROOT'])
+    if _python_bitness() == 64:
+        sig_roots.extend([_BPV_SIG_ROOT, _BPV_SIG_ROOT_64])
+    else:
+        sig_roots.extend([_BPV_SIG_ROOT_64, _BPV_SIG_ROOT])
+
+    seen = set()
+    for sig_root in sig_roots:
+        if sig_root in seen:
+            continue
+        seen.add(sig_root)
+        yield os.path.join(sig_root, _BPV_ETS_MANAGER_REL)
+
+
+def _find_32bit_python():
+    env_python = os.environ.get('AUTO_PTS_PYTHON32')
+    if env_python and os.path.isfile(env_python):
+        return env_python
+
+    try:
+        proc = subprocess.run(
+            ['py', '-3-32', '-c', 'import sys; print(sys.executable)'],
+            capture_output=True, text=True, timeout=15, check=False)
+        if proc.returncode == 0:
+            exe = proc.stdout.strip()
+            if exe and os.path.isfile(exe):
+                return exe
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    return None
+
+
+def _default_ets_manager_path():
+    for path in _iter_ets_manager_paths():
+        if os.path.isfile(path):
+            return path
+    sig_root = os.environ.get('PTS_SIG_ROOT', _BPV_SIG_ROOT)
+    return os.path.join(sig_root, _BPV_ETS_MANAGER_REL)
+
+def _format_pts_test_case_name(test_case_name):
+    return test_case_name.replace('/', '_').replace('-', '_')
+
+
+def _find_latest_test_log_dir(log_root, project_name, test_case_name):
+    profile_dir = os.path.join(log_root, project_name)
+    if not os.path.isdir(profile_dir):
+        return None
+
+    prefix = _format_pts_test_case_name(test_case_name) + '_'
+    candidates = []
+    for name in os.listdir(profile_dir):
+        path = os.path.join(profile_dir, name)
+        if os.path.isdir(path) and name.startswith(prefix):
+            candidates.append((os.path.getmtime(path), path))
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+class _PtsBpvSniffer:
+    """ctypes wrapper around ETSManager SnifferSave* exports."""
+
+    def __init__(self, dll_path=None):
+        self._lib = None
+        self._dll_path = None
+        self._subprocess_python = None
+
+        candidates = [dll_path] if dll_path else list(_iter_ets_manager_paths())
+        last_exc = None
+
+        for path in candidates:
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                self._lib = ctypes.CDLL(path)
+                self._dll_path = path
+                log('Loaded ETSManager from %s (%d-bit Python)', path, _python_bitness())
+                return
+            except OSError as exc:
+                last_exc = exc
+                winerror = getattr(exc, 'winerror', None)
+                if winerror == 193:
+                    log('ETSManager.dll at %s needs 32-bit Python (server is %d-bit)',
+                        path, _python_bitness())
+                    self._dll_path = path
+                    continue
+                logging.warning('Failed to load ETSManager.dll from %s: %s', path, exc)
+
+        if self._dll_path and last_exc and getattr(last_exc, 'winerror', None) == 193:
+            self._subprocess_python = _find_32bit_python()
+            if self._subprocess_python:
+                log('BPV save will use 32-bit Python %s for %s',
+                    self._subprocess_python, self._dll_path)
+            else:
+                logging.warning(
+                    'ETSManager.dll is 32-bit but autoptsserver runs %d-bit Python. '
+                    'Install 32-bit Python and set AUTO_PTS_PYTHON32 to its python.exe, '
+                    'or use "py -3-32". Last load error: %s',
+                    _python_bitness(), last_exc)
+            return
+
+        if not self._dll_path:
+            logging.warning('ETSManager.dll not found (checked %s)', list(candidates))
+        elif last_exc:
+            logging.warning('Failed to load ETSManager.dll from %s: %s',
+                            self._dll_path, last_exc)
+
+    @property
+    def available(self):
+        return self._lib is not None or self._subprocess_python is not None
+
+    def _save_inprocess(self, cfa_path, timeout):
+        os.makedirs(os.path.dirname(cfa_path), exist_ok=True)
+        path_bytes = cfa_path.encode('mbcs')
+
+        self._lib.SnifferCanSaveEx.restype = ctypes.c_bool
+        self._lib.SnifferCanSaveAndClearEx.restype = ctypes.c_bool
+
+        can_save = bool(self._lib.SnifferCanSaveEx())
+        can_save_clear = bool(self._lib.SnifferCanSaveAndClearEx())
+        log('SnifferCanSaveEx=%s SnifferCanSaveAndClearEx=%s path=%s',
+            can_save, can_save_clear, cfa_path)
+
+        if not can_save and not can_save_clear:
+            logging.warning('BPV sniffer cannot save (Fts.exe not capturing?)')
+            return False
+
+        self._lib.SnifferSaveEx.argtypes = [ctypes.c_char_p]
+        self._lib.SnifferSaveAndClearEx.argtypes = [ctypes.c_char_p]
+
+        if can_save:
+            self._lib.SnifferSaveEx(path_bytes)
+        else:
+            self._lib.SnifferSaveAndClearEx(path_bytes)
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.isfile(cfa_path) and os.path.getsize(cfa_path) > 0:
+                log('BPV capture saved: %s (%d bytes)', cfa_path,
+                    os.path.getsize(cfa_path))
+                return True
+            time.sleep(0.5)
+
+        logging.warning('BPV capture not found after save: %s', cfa_path)
+        return False
+
+    def _save_subprocess(self, cfa_path, timeout):
+        try:
+            proc = subprocess.run(
+                [self._subprocess_python, '-c', _BPV_SAVE_SUBPROCESS_PY,
+                 self._dll_path, cfa_path],
+                capture_output=True, text=True, timeout=timeout + 5, check=False)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            logging.warning('BPV subprocess save failed: %s', exc)
+            return False
+
+        if proc.returncode == 0:
+            log('BPV capture saved via 32-bit Python: %s (%d bytes)', cfa_path,
+                os.path.getsize(cfa_path))
+            return True
+
+        if proc.returncode == 2:
+            logging.warning('BPV sniffer cannot save (Fts.exe not capturing?)')
+        else:
+            detail = proc.stderr.strip() or proc.stdout.strip()
+            logging.warning('BPV subprocess save failed (rc=%s): %s',
+                            proc.returncode, detail)
+        return False
+
+    def save(self, cfa_path, timeout=60):
+        if self._lib:
+            return self._save_inprocess(cfa_path, timeout)
+        if self._subprocess_python:
+            return self._save_subprocess(cfa_path, timeout)
+        return False
 
 
 class PyPTS:
@@ -820,11 +1044,8 @@ class PyPTS:
 
     def _get_bpv_sniffer(self):
         if self._bpv_sniffer is None:
-            try:
-                from autopts.bpv_sniffer import PtsBpvSniffer
-                self._bpv_sniffer = PtsBpvSniffer()
-            except ImportError as exc:
-                logging.warning('BPV sniffer module unavailable: %s', exc)
+            self._bpv_sniffer = _PtsBpvSniffer()
+            if not self._bpv_sniffer.available:
                 self._bpv_sniffer = False
         return self._bpv_sniffer if self._bpv_sniffer is not False else None
 
@@ -833,18 +1054,12 @@ class PyPTS:
             return
 
         try:
-            from autopts.bpv_sniffer import find_latest_test_log_dir
-        except ImportError as exc:
-            logging.warning('BPV save skipped: %s', exc)
-            return
-
-        try:
             log_root = self._workspace_log_root
             if not log_root or not os.path.isdir(log_root):
                 logging.warning('BPV save skipped: workspace log root %r missing', log_root)
                 return
 
-            test_dir = find_latest_test_log_dir(log_root, project_name, test_case_name)
+            test_dir = _find_latest_test_log_dir(log_root, project_name, test_case_name)
             if not test_dir:
                 logging.warning('BPV save skipped: no test log folder for %s %s under %s',
                                 project_name, test_case_name, log_root)
