@@ -54,7 +54,13 @@ import win32com.server.util
 from autopts.ptsprojects import ptstypes
 from autopts.ptsprojects.ptstypes import E_FATAL_ERROR
 from autopts.utils import PTS_WORKSPACE_FILE_EXT, ResultWithFlag, count_script_instances, get_own_workspaces
-from autopts.winutils import get_pid_by_window_title, kill_all_processes
+from autopts.winutils import (
+    bundled_32bit_python_path,
+    find_32bit_python,
+    get_pid_by_window_title,
+    kill_all_processes,
+    python_bitness,
+)
 
 logging = root_logging.getLogger('server')
 log = logging.debug
@@ -378,11 +384,6 @@ while time.time() < deadline:
 sys.exit(1)
 '''
 
-
-def _python_bitness():
-    return struct.calcsize('P') * 8
-
-
 def _iter_ets_manager_paths():
     env_dll = os.environ.get('AUTO_PTS_ETS_MANAGER_DLL')
     if env_dll:
@@ -391,7 +392,7 @@ def _iter_ets_manager_paths():
     sig_roots = []
     if os.environ.get('PTS_SIG_ROOT'):
         sig_roots.append(os.environ['PTS_SIG_ROOT'])
-    if _python_bitness() == 64:
+    if python_bitness() == 64:
         sig_roots.extend([_BPV_SIG_ROOT, _BPV_SIG_ROOT_64])
     else:
         sig_roots.extend([_BPV_SIG_ROOT_64, _BPV_SIG_ROOT])
@@ -402,26 +403,6 @@ def _iter_ets_manager_paths():
             continue
         seen.add(sig_root)
         yield os.path.join(sig_root, _BPV_ETS_MANAGER_REL)
-
-
-def _find_32bit_python():
-    env_python = os.environ.get('AUTO_PTS_PYTHON32')
-    if env_python and os.path.isfile(env_python):
-        return env_python
-
-    try:
-        proc = subprocess.run(
-            ['py', '-3-32', '-c', 'import sys; print(sys.executable)'],
-            capture_output=True, text=True, timeout=15, check=False)
-        if proc.returncode == 0:
-            exe = proc.stdout.strip()
-            if exe and os.path.isfile(exe):
-                return exe
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
-
-    return None
-
 
 def _default_ets_manager_path():
     for path in _iter_ets_manager_paths():
@@ -469,29 +450,30 @@ class _PtsBpvSniffer:
             try:
                 self._lib = ctypes.CDLL(path)
                 self._dll_path = path
-                log('Loaded ETSManager from %s (%d-bit Python)', path, _python_bitness())
+                log('Loaded ETSManager from %s (%d-bit Python)', path, python_bitness())
                 return
             except OSError as exc:
                 last_exc = exc
                 winerror = getattr(exc, 'winerror', None)
                 if winerror == 193:
                     log('ETSManager.dll at %s needs 32-bit Python (server is %d-bit)',
-                        path, _python_bitness())
+                        path, python_bitness())
                     self._dll_path = path
                     continue
                 logging.warning('Failed to load ETSManager.dll from %s: %s', path, exc)
 
         if self._dll_path and last_exc and getattr(last_exc, 'winerror', None) == 193:
-            self._subprocess_python = _find_32bit_python()
+            self._subprocess_python = find_32bit_python()
             if self._subprocess_python:
                 log('BPV save will use 32-bit Python %s for %s',
                     self._subprocess_python, self._dll_path)
             else:
+                bundled = bundled_32bit_python_path()
                 logging.warning(
                     'ETSManager.dll is 32-bit but autoptsserver runs %d-bit Python. '
-                    'Install 32-bit Python and set AUTO_PTS_PYTHON32 to its python.exe, '
-                    'or use "py -3-32". Last load error: %s',
-                    _python_bitness(), last_exc)
+                    'Install 32-bit Python embeddable package to %s, set AUTO_PTS_PYTHON32, '
+                    'or install the Python launcher ("py -3-32"). Last load error: %s',
+                    python_bitness(), bundled, last_exc)
             return
 
         if not self._dll_path:
