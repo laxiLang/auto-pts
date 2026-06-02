@@ -497,6 +497,7 @@ def init_pts_thread_entry(proxy, args, exceptions, finish_count):
     log("Opening workspace: %s", args.workspace)
     log("Copy workspace: %s", args.copy_workspace)
     proxy.open_workspace(args.workspace, args.copy_workspace)
+    proxy.save_test_history_log(True)
 
     if args.bd_addr:
         projects = proxy.get_project_list()

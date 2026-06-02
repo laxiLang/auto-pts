@@ -313,7 +313,6 @@ class PTSSender(win32com.server.connect.ConnectableServer):
         return win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_BSTR,
                                        [rsp, rsp_len, is_present])
 
-
 def parse_ptscontrol_error(err):
     try:
         # Decode HRESULT code from PTS exception

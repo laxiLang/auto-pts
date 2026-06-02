@@ -96,6 +96,13 @@ class CliParser(SmartDefaultsMixin, argparse.ArgumentParser):
                                "to running test case in PTS GUI using "
                                "'Run (Debug Logs)'")
 
+        self.add_argument("--bpv-save", dest="bpv_save", action='store_true',
+                          default=False,
+                          help="After each test case, export BPV .cfa capture "
+                               "to the PTS workspace via ETSManager.dll "
+                               "(requires Bluetooth Protocol Viewer on the "
+                               "PTS host). Can also set AUTO_PTS_BPV_SAVE=1.")
+
         self.add_argument("-c", "--test-cases", nargs='+', default=[],
                           action="extend",
                           help="Names of test cases to run. Groups of "
