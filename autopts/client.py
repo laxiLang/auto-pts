@@ -499,6 +499,9 @@ def init_pts_thread_entry(proxy, args, exceptions, finish_count):
     proxy.open_workspace(args.workspace, args.copy_workspace)
     proxy.save_test_history_log(True)
 
+    if getattr(args, 'bpv_save', False):
+        proxy.set_bpv_save(True)
+
     if args.bd_addr:
         projects = proxy.get_project_list()
         for project_name in projects:

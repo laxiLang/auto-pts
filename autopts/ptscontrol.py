@@ -371,6 +371,10 @@ class PyPTS:
         self._ready = False
 
         self._temp_workspace_path = None
+        self._workspace_log_root = None
+        self._bpv_save_enabled = os.environ.get('AUTO_PTS_BPV_SAVE', '').lower() in (
+            '1', 'true', 'yes')
+        self._bpv_sniffer = None
 
         self._pts = None
         self._pts_dispatch_id = None
@@ -729,8 +733,10 @@ class PyPTS:
             log("Using temporary workspace: %s", self._temp_workspace_path)
 
             self._pts.OpenWorkspace(self._temp_workspace_path)
+            self._workspace_log_root = temp_workspace_dir
         else:
             self._pts.OpenWorkspace(workspace_path)
+            self._workspace_log_root = os.path.dirname(workspace_path)
 
         self.add_recov(self.open_workspace, workspace_path, copy_workspace)
         self._cache_test_cases()
@@ -806,6 +812,62 @@ class PyPTS:
         self._recov_in_progress = False
         self._temp_changes = []
 
+    def set_bpv_save(self, enable):
+        """Enable explicit BPV .cfa export after each RunTestCase via ETSManager."""
+        log("%s %s", self.set_bpv_save.__name__, enable)
+        self._bpv_save_enabled = bool(enable)
+        self.add_recov(self.set_bpv_save, self._bpv_save_enabled)
+
+    def _get_bpv_sniffer(self):
+        if self._bpv_sniffer is None:
+            try:
+                from autopts.bpv_sniffer import PtsBpvSniffer
+                self._bpv_sniffer = PtsBpvSniffer()
+            except ImportError as exc:
+                logging.warning('BPV sniffer module unavailable: %s', exc)
+                self._bpv_sniffer = False
+        return self._bpv_sniffer if self._bpv_sniffer is not False else None
+
+    def _save_bpv_capture(self, project_name, test_case_name):
+        if not self._bpv_save_enabled:
+            return
+
+        try:
+            from autopts.bpv_sniffer import find_latest_test_log_dir
+        except ImportError as exc:
+            logging.warning('BPV save skipped: %s', exc)
+            return
+
+        try:
+            log_root = self._workspace_log_root
+            if not log_root or not os.path.isdir(log_root):
+                logging.warning('BPV save skipped: workspace log root %r missing', log_root)
+                return
+
+            test_dir = find_latest_test_log_dir(log_root, project_name, test_case_name)
+            if not test_dir:
+                logging.warning('BPV save skipped: no test log folder for %s %s under %s',
+                                project_name, test_case_name, log_root)
+                return
+
+            folder_name = os.path.basename(test_dir)
+            cfa_path = os.path.join(test_dir, folder_name + '.cfa')
+
+            if os.path.isfile(cfa_path) and os.path.getsize(cfa_path) > 0:
+                log('BPV capture already present: %s', cfa_path)
+                return
+
+            sniffer = self._get_bpv_sniffer()
+            if sniffer is None or not sniffer.available:
+                logging.warning('BPV save skipped: ETSManager.dll unavailable')
+                return
+
+            if not sniffer.save(cfa_path):
+                logging.warning('BPV save failed for %s', cfa_path)
+        except Exception as exc:
+            logging.warning('BPV save failed for %s %s: %s',
+                            project_name, test_case_name, exc)
+
     def run_test_case(self, project_name, test_case_name):
         """Executes the specified Test Case.
 
@@ -847,7 +909,7 @@ class PyPTS:
 
             err = self._pts_logger.get_test_case_status(timeout=30)
 
-            self._revert_temp_changes()
+            self._save_bpv_capture(project_name, test_case_name)
         except Exception as e:
             # PTS exception or COM Object exception
             if isinstance(e, pythoncom.com_error):
