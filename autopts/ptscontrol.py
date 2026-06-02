@@ -313,6 +313,20 @@ class PTSSender(win32com.server.connect.ConnectableServer):
         return win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_BSTR,
                                        [rsp, rsp_len, is_present])
 
+def _ptscontrol_error_code(err):
+    """Return PTSControl HRESULT from a COM error, or None."""
+    try:
+        if isinstance(err, pythoncom.com_error):
+            *_, hresult = err.excepinfo
+            return ctypes.c_uint32(hresult).value
+    except Exception:
+        pass
+    return None
+
+
+def _is_pixit_unchanged(err):
+    return _ptscontrol_error_code(err) == ptstypes.PTSCONTROL_E_PIXIT_PARAM_NOT_CHANGED
+
 def parse_ptscontrol_error(err):
     try:
         # Decode HRESULT code from PTS exception
@@ -942,6 +956,10 @@ class PyPTS:
                            param_value)
 
         except Exception as e:
+            if _is_pixit_unchanged(e):
+                log("PIXIT param not changed: %s %s %s", project_name,
+                    param_name, param_value)
+                return
             if isinstance(e, (pythoncom.com_error, TypeError)):
                 err = parse_ptscontrol_error(e)
                 if not err:
@@ -973,6 +991,10 @@ class PyPTS:
             self._add_temp_change(self.update_pixit_param, project_name,
                                   param_name)
         except Exception as e:
+            if _is_pixit_unchanged(e):
+                log("PIXIT param not changed: %s %s %s", project_name,
+                    param_name, new_param_value)
+                return
             if isinstance(e, (pythoncom.com_error, TypeError)):
                 err = parse_ptscontrol_error(e)
                 if not err:
