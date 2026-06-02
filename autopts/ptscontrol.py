@@ -843,6 +843,15 @@ class PyPTS:
             self.stop_test_case(project_name, test_case_name)
             self.recover_pts()
 
+        else:
+            try:
+                self._revert_temp_changes()
+            except Exception as e:
+                # Do not restart PTS after a completed test case because
+                # cleanup/revert failed (e.g. PIXIT already at target value).
+                logging.warning("Failed to revert temporary PIXIT changes after "
+                                "%s %s: %s", project_name, test_case_name, e)
+
         if not err:
             # Nonblocking methods will not throw exceptions
             err = E_FATAL_ERROR
@@ -1002,6 +1011,7 @@ class PyPTS:
 
         log("%s %s", self.save_test_history_log.__name__, save)
         self._pts.SaveTestHistoryLog(save)
+        self.add_recov(self.save_test_history_log, save)
 
     def _get_process_pid(self, retry=10):
         if self.__bd_addr is None:
